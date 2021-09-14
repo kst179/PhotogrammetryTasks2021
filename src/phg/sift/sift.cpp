@@ -18,7 +18,7 @@
 #define DEBUG_ENABLE     1
 #define DEBUG_PATH       std::string("data/debug/test_sift/debug/")
 
-#define NOCTAVES                    3                    // число октав
+#define NOCTAVES                    4                    // число октав
 #define OCTAVE_NLAYERS              3                    // в [lowe04] это число промежуточных степеней размытия картинки в рамках одной октавы обозначается - s, т.е. s слоев в каждой октаве
 #define OCTAVE_GAUSSIAN_IMAGES      (OCTAVE_NLAYERS + 3)
 #define OCTAVE_DOG_IMAGES           (OCTAVE_NLAYERS + 2)
@@ -27,6 +27,9 @@
 
 #define SUBPIXEL_FITTING_ENABLE      0    // такие тумблеры включающие/выключающие очередное улучшение алгоритма позволяют оценить какой вклад эта фича вносит в качество результата если в рамках уже готового алгоритма попробовать ее включить/выключить
 #define SUBPIXEL_FITTING_MAX_ITER    5
+
+#define PRINCIPAL_CURVATURES_RATIO   10
+#define PRINCIPAL_CURVATURES_THRESHOLD (PRINCIPAL_CURVATURES_RATIO + 1) * (PRINCIPAL_CURVATURES_RATIO + 1) / PRINCIPAL_CURVATURES_RATIO
 
 #define ORIENTATION_NHISTS           36   // число корзин при определении ориентации ключевой точки через гистограммы
 #define ORIENTATION_WINDOW_R         3    // минимальный радиус окна в рамках которого будет выбрана ориентиация (в пикселях), R=3 => 5x5 окно
@@ -82,6 +85,10 @@ void phg::SIFT::buildPyramids(const cv::Mat &imgOrg, std::vector<cv::Mat> &gauss
             size_t prevOctave = octave - 1;
             // берем картинку с предыдущей октавы и уменьшаем ее в два раза без какого бы то ни было дополнительного размытия (сигмы должны совпадать)
             cv::Mat img = gaussianPyramid[octave * OCTAVE_GAUSSIAN_IMAGES - 1].clone();
+
+            cv::Size automaticKernelSize = cv::Size(0, 0);
+            double sigma = INITIAL_IMG_SIGMA * pow(2.0, octave);
+            cv::GaussianBlur(img, img, automaticKernelSize, sigma, sigma);
             // тут есть очень важный момент, мы должны указать fx=0.5, fy=0.5 иначе при нечетном размере картинка будет не идеально 2 пикселя в один схлопываться - а слегка смещаться
             cv::resize(img, img, cv::Size(img.cols / 2, img.rows / 2), 0.5, 0.5, cv::INTER_NEAREST);
             gaussianPyramid[octave * OCTAVE_GAUSSIAN_IMAGES + layer] = img;
@@ -230,6 +237,13 @@ void phg::SIFT::findLocalExtremasAndDescribe(const std::vector<cv::Mat> &gaussia
                         float shift_z = 0.0f;
                         float dvalue = 0.0f;
                         // TODO сделать субпиксельное уточнение (хотя бы через параболу-фиттинг независимо по оси X и оси Y, но лучше через честный ряд Тейлора, матрицу Гессе и итеративное смещение если экстремум оказался в соседнем пикселе)
+#if false
+                        {
+                            shift_x = parabolaFitting(cur.at<float>(j, i - 1), cur.at<float>(j, i), cur.at<float>(j, i + 1));
+                            shift_y = parabolaFitting(cur.at<float>(j - 1, i), cur.at<float>(j, i), cur.at<float>(j + 1, i));
+                            dvalue = 0;
+                        }
+#endif
 #if SUBPIXEL_FITTING_ENABLE // такие тумблеры включающие/выключающие очередное улучшение алгоритма позволяют оценить какой вклад эта фича вносит в качество результата если в рамках уже готового алгоритма попробовать ее включить/выключить
                         {
 
@@ -295,6 +309,22 @@ void phg::SIFT::findLocalExtremasAndDescribe(const std::vector<cv::Mat> &gaussia
                         float contrast = center + dvalue;
                         if (contrast < contrast_threshold / OCTAVE_NLAYERS) // TODO почему порог контрастности должен уменьшаться при увеличении числа слоев в октаве?
                             continue;
+
+                        // TODO: сделать фильтрацию по главным кривизнам (principal curvatures)
+                        {
+                            float dxx = cur.at<float>(y, x + 1) + cur.at<float>(y, x - 1) - 2 * cur.at<float>(y, x);
+                            float dyy = cur.at<float>(y + 1, x) + cur.at<float>(y - 1, x) - 2 * cur.at<float>(y, x);
+                            float dxy = 0.25 * (cur.at<float>(y + 1, x + 1) + cur.at<float>(y - 1, x - 1) -
+                                                cur.at<float>(y + 1, x - 1) - cur.at<float>(y - 1, x + 1));
+
+                            float trace2 = dxx + dyy;
+                            trace2 *= trace2;
+                            float det = dxx*dyy - dxy * dxy;
+
+                            if (trace2 / det > PRINCIPAL_CURVATURES_THRESHOLD) {
+                                continue;
+                            }
+                        }
 
                         kp.pt = cv::Point2f((x + 0.5 + shift_x) * octave_downscale, (y + 0.5 + shift_y) * octave_downscale);
 
@@ -367,6 +397,10 @@ bool phg::SIFT::buildLocalOrientationHists(const cv::Mat &img, size_t i, size_t 
 
     for (size_t y = j - radius + 1; y < j + radius; ++y) {
         for (size_t x = i - radius + 1; x < i + radius; ++x) {
+            float r = (i - x) * (i - x) + (y - j) * (y - j);
+            float sigma = radius / 3;  // R = 3*sigma
+            float weight = 1 / std::sqrt(2 * M_PI) * std::exp(0.5 * r / sigma);
+
             // m(x, y)=(L(x + 1, y) − L(x − 1, y))^2 + (L(x, y + 1) − L(x, y − 1))^2
             double dIdx = 0.5 * (img.at<float>(x + 1, y) - img.at<float>(x - 1, y));
             double dIdy = 0.5 * (img.at<float>(x, y + 1) - img.at<float>(x, y - 1));
@@ -383,7 +417,7 @@ bool phg::SIFT::buildLocalOrientationHists(const cv::Mat &img, size_t i, size_t 
             static_assert(360 % ORIENTATION_NHISTS == 0, "Inappropriate bins number!");
             size_t bin = std::floor(orientation * ORIENTATION_NHISTS / 360.0);
             rassert(bin < ORIENTATION_NHISTS, 361236315613);
-            sum[bin] += magnitude;
+            sum[bin] += magnitude * weight;
             // TODO может быть сгладить получившиеся гистограммы улучшит результат? 
         }
     }
@@ -421,11 +455,11 @@ bool phg::SIFT::buildDescriptor(const cv::Mat &img, float px, float py, double d
                             int x = (int) (px + shift.x);
                             int y = (int) (py + shift.y);
 
-                            if (y - 1 < 0 || y + 1 > img.rows || x - 1 < 0 || x + 1 > img.cols)
+                            if (y - 1 < 0 || y + 1 >= img.rows || x - 1 < 0 || x + 1 >= img.cols)
                                 return false;
 
-                            double dx = 0.5 * (img.at<float>(x + 1, y) - img.at<float>(x - 1, y));
-                            double dy = 0.5 * (img.at<float>(x, y + 1) - img.at<float>(x, y - 1));
+                            double dx = 0.5 * (img.at<float>(y, x + 1) - img.at<float>(y, x - 1));
+                            double dy = 0.5 * (img.at<float>(y + 1, x) - img.at<float>(y - 1, x));
 
                             double magnitude = std::sqrt(dx * dx + dy * dy);
                             double orientation = atan2(dy, dx);
